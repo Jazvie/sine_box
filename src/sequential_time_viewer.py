@@ -1,6 +1,7 @@
 import sys
 import numpy as np
 import simpleaudio as sa
+from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QSlider, QLabel, QComboBox, QPushButton)
 from PyQt6.QtCore import Qt, QTimer
@@ -16,12 +17,14 @@ class SequentialTimeViewer(QMainWindow):
 
         # Audio settings
         self.Fs = 16000  # Hz (fixed)
-        self.display_duration = 0.05  # 50ms for display (show more detail)
+        self.display_duration = .05  # 50ms for display (show more detail)
         self.display_samples = int(self.Fs * self.display_duration)
-        self.audio_buffer_size = 1024  # Smaller buffer for more responsive updates
+        self.frame_size = 512  # Frame size for processing
+        self.hop_size = 128  # 75% overlap for smoother transitions
         self.play_obj = None
         self.is_playing = False
         self.last_samples = np.zeros(self.display_samples)  # For smoother display updates
+        self.audio_queue = deque(maxlen=4)  # Small queue for audio continuity
         
         # Initialize the generator
         self.generator = SequentialTimeGenerator(fs=self.Fs)
@@ -69,14 +72,10 @@ class SequentialTimeViewer(QMainWindow):
         # Connect controls to update function
         self.vowel_selector.currentTextChanged.connect(self.update_parameters)
         
-        # Set up timers
+        # Create update timer
         self.display_timer = QTimer()
         self.display_timer.timeout.connect(self.update_display)
-        self.display_timer.start(50)  # 20 Hz update rate for display
-
-        self.audio_timer = QTimer()
-        self.audio_timer.timeout.connect(self.update_audio)
-        self.audio_timer.start(20)  # 50 Hz update rate for audio
+        self.display_timer.start(8)  # 125 Hz for audio/display updates rate for consistent audio
 
     def create_parameter_sliders(self, layout):
         # Display fixed sample rate
@@ -129,46 +128,48 @@ class SequentialTimeViewer(QMainWindow):
         )
 
     def update_display(self):
-        """Update the waveform display with smoothing"""
-        # Generate samples for display
-        samples = self.generator.generate_samples(self.display_samples)
-        
-        # Smooth display updates
-        alpha = 0.7  # Smoothing factor
-        smoothed = alpha * samples + (1 - alpha) * self.last_samples
-        self.last_samples = smoothed
-        
-        # Update plot with anti-aliased line
-        t = np.linspace(0, self.display_duration, len(smoothed))
-        self.plot_line.setData(t, smoothed, antialias=True)
-
-    def update_audio(self):
-        """Generate and play audio samples if audio is enabled"""
+        """Update the waveform display using audio samples"""
         if not self.is_playing:
             return
+
+        # Generate new samples for both audio and display
+        new_samples = self.generator.generate_samples(self.hop_size)
+        self.audio_queue.append(new_samples)
+        
+        # Update display with the latest audio data
+        if self.audio_queue:
+            # Get the most recent samples for display
+            display_data = np.concatenate(list(self.audio_queue))
+            if len(display_data) > self.display_samples:
+                display_data = display_data[-self.display_samples:]
+            elif len(display_data) < self.display_samples:
+                display_data = np.pad(display_data, (0, self.display_samples - len(display_data)))
             
-        # Generate new samples
-        samples = self.generator.generate_samples(self.audio_buffer_size)
+            # Smooth display updates
+            alpha = 0.7  # Smoothing factor
+            smoothed = alpha * display_data + (1 - alpha) * self.last_samples
+            self.last_samples = smoothed
+            
+            # Update plot with anti-aliased line
+            t = np.linspace(0, self.display_duration, len(smoothed))
+            self.plot_line.setData(t, smoothed, antialias=True)
         
-        # Apply smooth normalization
-        max_val = np.max(np.abs(samples))
-        if max_val > 1e-6:
-            # Use soft normalization to prevent sudden changes
-            target_gain = 0.95 / max_val
-            self.current_gain = getattr(self, 'current_gain', target_gain)
-            self.current_gain = 0.95 * self.current_gain + 0.05 * target_gain
-            normalized = samples * self.current_gain
-        else:
-            normalized = samples
-        
-        # Convert to 16-bit integers with safety bounds
-        bounded = np.clip(normalized, -1.0, 1.0)
-        audio_data = (bounded * 32767).astype(np.int16)
-        
-        # Play audio
-        if self.play_obj is not None and self.play_obj.is_playing():
-            return
-        self.play_obj = sa.play_buffer(audio_data, 1, 2, self.Fs)
+        # Play audio if we have enough samples
+        if len(self.audio_queue) >= 3 and (self.play_obj is None or not self.play_obj.is_playing()):
+            # Concatenate chunks with overlap
+            chunks = list(self.audio_queue)
+            output = np.concatenate(chunks[:-1])
+            
+            # Convert to 16-bit integers
+            bounded = np.clip(output, -1.0, 1.0)
+            audio_data = (bounded * 32767).astype(np.int16)
+            
+            # Play audio
+            self.play_obj = sa.play_buffer(audio_data, 1, 2, self.Fs)
+            
+            # Keep last chunk for continuity
+            self.audio_queue.clear()
+            self.audio_queue.append(chunks[-1])
 
     def toggle_audio(self, checked):
         """Toggle audio playback"""

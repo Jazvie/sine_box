@@ -18,19 +18,30 @@ class SequentialTimeGenerator:
         
         # Filter parameters
         self.current_formants = [(730, 80), (1090, 90), (2440, 120)]  # Default to 'a'
+        self.filter_coeffs = []  # Will store (b, a) coefficients
+        self.filter_states = []  # Will store filter states
         
-        # Overlap-add parameters
-        self.frame_size = 1024  # Frame size for good frequency resolution
-        self.hop_size = 256     # 75% overlap for smooth transitions
-        self.overlap_factor = self.frame_size // self.hop_size
+        # Streaming parameters
+        self.frame_size = 512  # Frame size for processing
+        self.hop_size = 128   # 75% overlap for smoother transitions
         
-        # Initialize buffers for overlap-add
-        self.input_buffer = deque(maxlen=self.frame_size)
+        # Initialize buffers
+        self.input_buffer = np.zeros(self.frame_size)
         self.output_buffer = np.zeros(self.frame_size)
-        self.overlap_buffer = np.zeros(self.frame_size)
+        self.prev_output = np.zeros(self.hop_size)  # For overlap-add
         
-        # Window function for overlap-add
+        # Create window for overlap-add
         self.window = np.hanning(self.frame_size)
+        # Normalize window for perfect reconstruction
+        overlap_sum = np.zeros(self.frame_size)
+        for i in range(0, self.frame_size - self.hop_size + 1, self.hop_size):
+            overlap_sum[i:i+self.hop_size] += self.window[i:i+self.hop_size] ** 2
+        self.window = self.window / np.sqrt(overlap_sum + 1e-10)
+        
+        # Global gain smoothing with slower changes
+        self.current_gain = 1.0
+        self.target_gain = 1.0
+        self.gain_smoothing = 0.995  # Smooth gain changes
         
         # Initialize filter state
         self._update_filter_coeffs()
@@ -142,96 +153,90 @@ class SequentialTimeGenerator:
         return blended
 
     def _apply_formant_filters(self, frame):
-        """Apply formant filters in series using overlap-add method with robust stability checks"""
-        # Apply window to input frame
-        windowed_frame = frame * self.window
+        """Apply formant filters with overlap-add processing"""
+        frame_len = len(frame)
         
-        # Apply each formant filter in series
-        filtered = windowed_frame.copy()
+        # Ensure input buffer has enough space
+        if len(self.input_buffer) < frame_len + self.hop_size:
+            self.input_buffer = np.zeros(frame_len + self.hop_size)
+        
+        # Shift input buffer and add new frame
+        self.input_buffer[:-frame_len] = self.input_buffer[frame_len:]
+        self.input_buffer[-frame_len:] = frame
+        
+        # Apply window
+        windowed = self.input_buffer[:self.frame_size] * self.window
+        
+        # Apply filters in series with careful state handling
+        filtered = windowed.copy()
         for i, (b, a) in enumerate(self.filter_coeffs):
-            # Apply filter and update state
-            filtered, self.filter_states[i] = lfilter(b, a, filtered, zi=self.filter_states[i])
+            # Apply filter with current state
+            filtered, new_state = lfilter(b, a, filtered, zi=self.filter_states[i])
             
-            # Check for instability or overflow
+            # Smooth state updates and handle instability
             if np.any(np.abs(filtered) > 10.0) or np.any(np.isnan(filtered)) or np.any(np.isinf(filtered)):
-                # Reset filter state and use a simple one-pole smoothing filter
-                self.filter_states[i] = np.zeros_like(self.filter_states[i])
-                alpha = 0.99
-                filtered = alpha * filtered[:-1] + (1 - alpha) * windowed_frame[1:]
-                filtered = np.append(filtered[0], filtered)
-            
-            # Normalize to prevent cumulative gain
-            max_val = np.max(np.abs(filtered))
-            if max_val > 1e-6:
-                filtered = filtered / max_val
+                # Gradually recover from instability
+                self.filter_states[i] = 0.9 * self.filter_states[i]
+                filtered = windowed  # Reset to input
+            else:
+                # Smooth state update
+                self.filter_states[i] = 0.95 * self.filter_states[i] + 0.05 * new_state
         
-        return filtered
-
-            
-    def generate_samples(self, num_samples):
-        """Generate the next batch of samples with formant filtering using overlap-add"""
-        # Generate time points
-        t = np.arange(num_samples) / self.fs + self.phase / (2 * np.pi * self.current_f0)
-        
-        # Generate base waveform
-        new_samples = self._generate_base_waveform(t, self.current_morph)
-        
-        # Normalize input samples
-        max_val = np.max(np.abs(new_samples))
+        # Apply smooth gain control
+        max_val = np.max(np.abs(filtered))
         if max_val > 1e-6:
-            new_samples = new_samples / max_val
+            self.target_gain = min(1.0, 0.95 / max_val)
+        self.current_gain = 0.995 * self.current_gain + 0.005 * self.target_gain
+        filtered *= self.current_gain
         
-        # Update phase for continuity
-        self.phase = (self.phase + 2 * np.pi * self.current_f0 * num_samples / self.fs) % (2 * np.pi)
-        
-        # Add new samples to input buffer
-        for sample in new_samples:
-            self.input_buffer.append(sample)
-        
-        # Process if we have enough samples
-        if len(self.input_buffer) >= self.frame_size:
-            # Get frame and apply filtering
-            frame = np.array(self.input_buffer)
-            filtered_frame = self._apply_formant_filters(frame)
-            
-            # Overlap-add with normalization
-            self.output_buffer[:self.frame_size-self.hop_size] = self.output_buffer[self.hop_size:]
-            self.output_buffer[self.frame_size-self.hop_size:] = 0
-            self.output_buffer += filtered_frame
-            
-            # Normalize output buffer
-            max_val = np.max(np.abs(self.output_buffer))
-            if max_val > 1e-6:
-                self.output_buffer = self.output_buffer / max_val
-            
-            # Clear processed samples from input buffer
-            for _ in range(self.hop_size):
-                self.input_buffer.popleft()
-        
-        # Return the next batch of samples
-        output = self.output_buffer[:num_samples].copy()
-        self.output_buffer = np.roll(self.output_buffer, -num_samples)
-        self.output_buffer[-num_samples:] = 0
-        
-        # Final safety check
-        if np.any(np.isnan(output)) or np.any(np.isinf(output)):
-            output = np.zeros_like(output)
+        # Extract output with overlap-add
+        output = np.zeros(frame_len)
+        if frame_len <= self.hop_size:
+            output = filtered[:frame_len]
+        else:
+            # Add previous overlap
+            output[:self.hop_size] = self.prev_output + filtered[:self.hop_size]
+            # Copy remaining samples
+            output[self.hop_size:] = filtered[self.hop_size:frame_len]
+            # Save overlap for next frame
+            if frame_len + self.hop_size <= len(filtered):
+                self.prev_output = filtered[frame_len:frame_len + self.hop_size]
+            else:
+                self.prev_output = np.zeros(self.hop_size)
         
         return output
 
-    def update_parameters(self, f0=None, morph=None, formants=None, max_harmonic=None):
-        """Update generator parameters smoothly"""
-        if f0 is not None:
-            # Adjust phase to maintain continuity when frequency changes
-            self.phase = self.phase * (f0 / self.current_f0)
-            self.current_f0 = f0
+    def generate_samples(self, num_samples):
+        """Generate samples with streaming formant filtering"""
+        output = np.zeros(num_samples)
+        current_pos = 0
+        
+        while current_pos < num_samples:
+            # Generate in small chunks
+            chunk_size = min(self.hop_size, num_samples - current_pos)
             
+            # Generate base waveform
+            t = np.arange(chunk_size) / self.fs + self.phase / (2 * np.pi * self.current_f0)
+            chunk = self._generate_base_waveform(t, self.current_morph)
+            
+            # Apply formant filtering
+            filtered = self._apply_formant_filters(chunk)
+            
+            # Add to output
+            output[current_pos:current_pos + chunk_size] = filtered[:chunk_size]
+            
+            # Update phase and position
+            self.phase = (self.phase + 2 * np.pi * self.current_f0 * chunk_size / self.fs) % (2 * np.pi)
+            current_pos += chunk_size
+        
+        return output
+
+    def update_parameters(self, f0=None, morph=None, formants=None):
+        """Update synthesis parameters"""
+        if f0 is not None:
+            self.current_f0 = f0
         if morph is not None:
             self.current_morph = morph
-            
-        if max_harmonic is not None:
-            self.current_max_harmonic = max_harmonic
-            
         if formants is not None:
             self.current_formants = formants
             self._update_filter_coeffs()
